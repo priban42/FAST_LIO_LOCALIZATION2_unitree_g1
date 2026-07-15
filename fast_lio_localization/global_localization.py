@@ -145,6 +145,11 @@ class FastLIOLocalization(Node):
                 ("base_roll", 0.0),
                 ("base_pitch", 0.0),  # 180 deg pitch to correct inverted mounting
                 ("base_yaw", 0.0),
+                # Configurable multi-scale ICP schedule
+                ("icp_scales", [5.0, 1.0]),
+                # Yaw-retry behavior when fitness is too low
+                ("yaw_retry_fitness_threshold", 0.95),
+                ("yaw_retry_max_attempts", 4),
             ],
         )
 
@@ -154,7 +159,7 @@ class FastLIOLocalization(Node):
         self.pub_pc_in_map = self.create_publisher(PointCloud2, "/cur_scan_in_map", 10)
         self.pub_submap = self.create_publisher(PointCloud2, "/submap", 10)
         self.pub_map_to_odom = self.create_publisher(Odometry, "/map_to_odom", 10)
-        
+
         # New Debug Publisher to verify coordinate frame alignment visually
         self.pub_aligned_debug = self.create_publisher(PointCloud2, "/cloud_aligned_debug", 10)
 
@@ -170,7 +175,7 @@ class FastLIOLocalization(Node):
         # Active gravity alignment subscription
         self.imu_topic = self.get_parameter("imu_topic").value
         self.num_samples = self.get_parameter("num_samples").value
-        
+
         if self.num_samples > 0:
             self.get_logger().info(
                 f"Starting active Gravity Alignment phase. Collecting {self.num_samples} "
@@ -273,9 +278,47 @@ class FastLIOLocalization(Node):
             1.0 * scale,
             initial,
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=10),
         )
         return result_icp.transformation, result_icp.fitness
+
+    def run_multiscale_icp(self, scan, map_cloud, initial, scales):
+        """
+        Runs registration_at_scale sequentially over a list of scales,
+        feeding each result's transformation as the initial guess for the next.
+        Returns (final_transformation, final_fitness, per_scale_fitness_list).
+        """
+        transformation = initial
+        fitness = 0.0
+        fitness_log = []
+        for scale in scales:
+            transformation, fitness = self.registration_at_scale(
+                scan, map_cloud, initial=transformation, scale=scale
+            )
+            fitness_log.append(fitness)
+        return transformation, fitness, fitness_log
+
+    def _yaw_retry_angle_deg(self, retry_index):
+        """
+        retry_index starts at 1 for the first retry (i.e. the 2nd overall attempt).
+        Sequence: 180, 90, 180, 45, 180, 22.5, 180, ...
+        Odd retry_index -> always 180.
+        Even retry_index -> 180 / 2^(retry_index // 2).
+        """
+        if retry_index % 2 == 1:
+            return 180.0
+        return 180.0 / (2 ** (retry_index // 2))
+
+    def _rotate_pose_z(self, pose, angle_rad):
+        """Rotate a pose about its own z-axis (yaw), keeping position unchanged."""
+        c, s = math.cos(angle_rad), math.sin(angle_rad)
+        rot = np.eye(4)
+        rot[:3, :3] = np.array([
+            [c, -s, 0.0],
+            [s,  c, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        return np.matmul(pose, rot)
 
     def inverse_se3(self, trans):
         trans_inverse = np.eye(4)
@@ -336,22 +379,46 @@ class FastLIOLocalization(Node):
         global_map_in_FOV = self.crop_global_map_in_FOV(pose_estimation)
         if global_map_in_FOV is None:
             return
-        
-        # Coarse pass: wide correspondence distance, rough alignment
-        transformation, coarse_fitness = self.registration_at_scale(
-            scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5
-        )
-        transformation, semicoarse_fitness = self.registration_at_scale(
-            scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=3
-        )
-        # Fine pass
-        transformation, fitness = self.registration_at_scale(
-            scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1
-        )
 
-        self.get_logger().info(
-            f"ICP fitness:\n coarse={coarse_fitness:.4f}\n semicoarse={semicoarse_fitness:.4f}\n fine={fitness:.4f}"
-        )
+        scales = self.get_parameter("icp_scales").value
+        retry_threshold = self.get_parameter("yaw_retry_fitness_threshold").value
+        max_attempts = self.get_parameter("yaw_retry_max_attempts").value
+
+        best_transformation = None
+        best_fitness = -1.0
+        attempt = 1
+        current_initial = pose_estimation
+
+        while True:
+            self.get_logger().info(f"f\n{current_initial}")
+            transformation, fitness, fitness_log = self.run_multiscale_icp(
+                scan_tobe_mapped, global_map_in_FOV, current_initial, scales
+            )
+
+            self.get_logger().info(
+                f"Attempt {attempt}/{max_attempts + 1}: "
+                + ", ".join(f"scale={s:.2f}->fitness={f:.4f}" for s, f in zip(scales, fitness_log))
+            )
+
+            if fitness > best_fitness:
+                best_fitness = fitness
+                best_transformation = transformation
+
+            if fitness >= retry_threshold or attempt > max_attempts:
+                break
+
+            retry_index = attempt  # 1st retry corresponds to attempt index 1
+            yaw_offset_deg = self._yaw_retry_angle_deg(retry_index)
+            self.get_logger().warn(
+                f"Fitness {fitness:.4f} below retry threshold {retry_threshold}. "
+                f"Retrying with {yaw_offset_deg:.2f} deg yaw offset from initial estimate "
+                f"(attempt {attempt + 1}/{max_attempts + 1})."
+            )
+            current_initial = self._rotate_pose_z(pose_estimation, math.radians(yaw_offset_deg))
+            attempt += 1
+
+        transformation = best_transformation
+        fitness = best_fitness
 
         if is_initialpose or fitness > self.get_parameter("localization_threshold").value:
             self.get_logger().info(f"Applying transformation matrix (Fitness: {fitness:.4f})")
@@ -359,7 +426,8 @@ class FastLIOLocalization(Node):
             self.publish_odom(transformation)
         else:
             self.get_logger().warn(
-                f"Fitness score {fitness} less than threshold. Tracking dropped to maintain last safe pose."
+                f"Best fitness {fitness:.4f} across {attempt} attempt(s) still below threshold. "
+                "Tracking dropped to maintain last safe pose."
             )
 
         # --- DEBUG VISUALIZATION PIPELINE ---
@@ -372,9 +440,9 @@ class FastLIOLocalization(Node):
         debug_header.frame_id = "map"
 
         self.publish_point_cloud(
-            self.pub_aligned_debug, 
-            debug_header, 
-            aligned_np, 
+            self.pub_aligned_debug,
+            debug_header,
+            aligned_np,
             intensity=self.cur_scan_intensity
         )
 
@@ -410,6 +478,8 @@ class FastLIOLocalization(Node):
 
     def cb_initialize_pose(self, msg):
         initial_pose = self.pose_to_mat(msg.pose.pose)
+        T_upside_down = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+        initial_pose = initial_pose@T_upside_down
         self.initialized = True
         self.get_logger().info("Initial pose overridden manually.")
 
