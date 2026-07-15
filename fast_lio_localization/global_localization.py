@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 import open3d as o3d
+import open3d.core as o3c  # Open3D Tensor Core
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -127,6 +128,9 @@ class FastLIOLocalization(Node):
         self._acc_samples = []
         self._gravity_aligned = False
 
+        # Initialize Tensor Core CPU device
+        self.device = o3c.Device("CPU:0")
+
         self.declare_parameters(
             namespace="",
             parameters=[
@@ -150,6 +154,11 @@ class FastLIOLocalization(Node):
                 # Yaw-retry behavior when fitness is too low
                 ("yaw_retry_fitness_threshold", 0.95),
                 ("yaw_retry_max_attempts", 4),
+                # Configurable translation search grid
+                ("translation_retry_step", 7.0),
+                ("translation_retry_max_attempts", 9),
+                # Pipeline backend selection (Tensor vs Legacy)
+                ("use_tensor_api", True),
             ],
         )
 
@@ -271,10 +280,11 @@ class FastLIOLocalization(Node):
             intensity = np.asarray(pc_array["intensity"]).reshape(-1).astype(np.float32)
         return xyz, intensity
 
-    def registration_at_scale(self, scan, map, initial, scale):
+    def registration_legacy(self, scan_down, map_down, initial, scale):
+        """Legacy registration pipeline using Open3D's standard API."""
         result_icp = o3d.pipelines.registration.registration_icp(
-            self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale),
-            self.voxel_down_sample(map, self.get_parameter("map_voxel_size").value * scale),
+            scan_down,
+            map_down,
             1.0 * scale,
             initial,
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
@@ -282,28 +292,26 @@ class FastLIOLocalization(Node):
         )
         return result_icp.transformation, result_icp.fitness
 
-    def run_multiscale_icp(self, scan, map_cloud, initial, scales):
-        """
-        Runs registration_at_scale sequentially over a list of scales,
-        feeding each result's transformation as the initial guess for the next.
-        Returns (final_transformation, final_fitness, per_scale_fitness_list).
-        """
-        transformation = initial
-        fitness = 0.0
-        fitness_log = []
-        for scale in scales:
-            transformation, fitness = self.registration_at_scale(
-                scan, map_cloud, initial=transformation, scale=scale
-            )
-            fitness_log.append(fitness)
-        return transformation, fitness, fitness_log
+    def registration_tensor(self, scan_tensor, map_tensor, initial, scale):
+        """High-performance registration pipeline utilizing Open3D Tensors."""
+        init_tensor = o3c.Tensor(initial, dtype=o3c.float64, device=self.device)
+        result_icp = o3d.t.pipelines.registration.icp(
+            scan_tensor,
+            map_tensor,
+            max_correspondence_distance=1.0 * scale,
+            init_source_to_target=init_tensor,
+            estimation_method=o3d.t.pipelines.registration.TransformationEstimationPointToPoint(),
+            criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=10),
+        )
+        # Convert tensor attributes back to python/numpy format
+        transformation = result_icp.transformation.numpy()
+        fitness = float(result_icp.fitness)
+        return transformation, fitness
 
     def _yaw_retry_angle_deg(self, retry_index):
         """
         retry_index starts at 1 for the first retry (i.e. the 2nd overall attempt).
         Sequence: 180, 90, 180, 45, 180, 22.5, 180, ...
-        Odd retry_index -> always 180.
-        Even retry_index -> 180 / 2^(retry_index // 2).
         """
         if retry_index % 2 == 1:
             return 180.0
@@ -319,6 +327,32 @@ class FastLIOLocalization(Node):
             [0.0, 0.0, 1.0],
         ])
         return np.matmul(pose, rot)
+
+    def _generate_grid_offsets(self, step, max_attempts):
+        """
+        Generates grid translation offsets (dx, dy) starting from [0,0]
+        and spiraling outwards: [0, 0], [step, 0], [-step, 0], [0, step], [0, -step]...
+        """
+        offsets = []
+        visited = set()
+        layer = 0
+        
+        while len(offsets) < max_attempts:
+            layer_points = []
+            for dx in range(-layer, layer + 1):
+                for dy in range(-layer, layer + 1):
+                    if max(abs(dx), abs(dy)) == layer:
+                        pt = (float(dx * step), float(dy * step))
+                        if pt not in visited:
+                            layer_points.append(pt)
+                            visited.add(pt)
+            
+            # Sort layer coordinates so that closer positions are tried first
+            layer_points.sort(key=lambda p: (abs(p[0]) + abs(p[1]), p[0]**2 + p[1]**2))
+            offsets.extend(layer_points)
+            layer += 1
+            
+        return offsets[:max_attempts]
 
     def inverse_se3(self, trans):
         trans_inverse = np.eye(4)
@@ -365,8 +399,10 @@ class FastLIOLocalization(Node):
             cropped_colors = np.squeeze(self.global_map_colors[indices, :])
             global_map_in_FOV.colors = o3d.utility.Vector3dVector(cropped_colors.astype(np.float64) / 255.0)
 
-        header = self.cur_odom.header
+        # --- FIXED LINES ---
+        header = copy.deepcopy(self.cur_odom.header)
         header.frame_id = "map"
+        # -------------------
 
         sub_points = np.array(global_map_in_FOV.points)[::10]
         sub_rgb = cropped_colors[::10] if cropped_colors is not None else None
@@ -380,42 +416,97 @@ class FastLIOLocalization(Node):
         if global_map_in_FOV is None:
             return
 
+        # Fetch configurations
         scales = self.get_parameter("icp_scales").value
         retry_threshold = self.get_parameter("yaw_retry_fitness_threshold").value
-        max_attempts = self.get_parameter("yaw_retry_max_attempts").value
+        max_yaw_attempts = self.get_parameter("yaw_retry_max_attempts").value
+        translation_step = self.get_parameter("translation_retry_step").value
+        max_trans_attempts = self.get_parameter("translation_retry_max_attempts").value
+        use_tensor_api = self.get_parameter("use_tensor_api").value
+
+        # Local variables to cache parameter values (avoid ROS 2 parameter overhead in tight loops)
+        scan_voxel_size = self.get_parameter("scan_voxel_size").value
+        map_voxel_size = self.get_parameter("map_voxel_size").value
+
+        # --- OPTIMIZATION STEP: PRE-DOWNSAMPLE AND CACHE CLOUDS ONCE ---
+        cached_scans = {}
+        cached_maps = {}
+
+        for scale in scales:
+            # 1. Downsample legacy representations
+            scan_down = self.voxel_down_sample(scan_tobe_mapped, scan_voxel_size * scale)
+            map_down = self.voxel_down_sample(global_map_in_FOV, map_voxel_size * scale)
+            
+            # 2. Cache either legacy or high-performance tensor formats
+            if use_tensor_api:
+                cached_scans[scale] = o3d.t.geometry.PointCloud.from_legacy(scan_down, device=self.device)
+                cached_maps[scale] = o3d.t.geometry.PointCloud.from_legacy(map_down, device=self.device)
+            else:
+                cached_scans[scale] = scan_down
+                cached_maps[scale] = map_down
 
         best_transformation = None
         best_fitness = -1.0
-        attempt = 1
-        current_initial = pose_estimation
+        success = False
 
-        while True:
-            self.get_logger().info(f"f\n{current_initial}")
-            transformation, fitness, fitness_log = self.run_multiscale_icp(
-                scan_tobe_mapped, global_map_in_FOV, current_initial, scales
-            )
+        grid_offsets = self._generate_grid_offsets(translation_step, max_trans_attempts)
 
-            self.get_logger().info(
-                f"Attempt {attempt}/{max_attempts + 1}: "
-                + ", ".join(f"scale={s:.2f}->fitness={f:.4f}" for s, f in zip(scales, fitness_log))
-            )
+        # Loop through search grid translation offsets
+        for grid_idx, (tx, ty) in enumerate(grid_offsets):
+            shifted_pose = copy.deepcopy(pose_estimation)
+            shifted_pose[0, 3] += tx
+            shifted_pose[1, 3] += ty
 
-            if fitness > best_fitness:
-                best_fitness = fitness
-                best_transformation = transformation
+            current_initial = shifted_pose
+            attempt = 1
 
-            if fitness >= retry_threshold or attempt > max_attempts:
+            # Run orientation retries for this translation offset
+            while True:
+                self.get_logger().info(
+                    f"Grid [{grid_idx + 1}/{len(grid_offsets)}]: offset [{tx:.1f}, {ty:.1f}], rot attempt {attempt}/{max_yaw_attempts + 1}..."
+                )
+                
+                # Manual multi-scale iteration over cached elements
+                transformation = current_initial
+                fitness = 0.0
+                fitness_log = []
+
+                for scale in scales:
+                    if use_tensor_api:
+                        transformation, fitness = self.registration_tensor(
+                            cached_scans[scale], cached_maps[scale], initial=transformation, scale=scale
+                        )
+                    else:
+                        transformation, fitness = self.registration_legacy(
+                            cached_scans[scale], cached_maps[scale], initial=transformation, scale=scale
+                        )
+                    fitness_log.append(fitness)
+
+                self.get_logger().info(
+                    f"Offset [{tx:.1f}, {ty:.1f}], Rot Attempt {attempt}: "
+                    + ", ".join(f"scale={s:.2f}->fitness={f:.4f}" for s, f in zip(scales, fitness_log))
+                )
+
+                if fitness > best_fitness:
+                    best_fitness = fitness
+                    best_transformation = transformation
+
+                if fitness >= retry_threshold:
+                    success = True
+                    break
+
+                if attempt > max_yaw_attempts:
+                    break
+
+                # Setup next yaw attempt
+                retry_index = attempt
+                yaw_offset_deg = self._yaw_retry_angle_deg(retry_index)
+                current_initial = self._rotate_pose_z(shifted_pose, math.radians(yaw_offset_deg))
+                attempt += 1
+
+            if success:
+                self.get_logger().info(f"Target fitness {fitness:.4f} achieved at offset [{tx:.1f}, {ty:.1f}]!")
                 break
-
-            retry_index = attempt  # 1st retry corresponds to attempt index 1
-            yaw_offset_deg = self._yaw_retry_angle_deg(retry_index)
-            self.get_logger().warn(
-                f"Fitness {fitness:.4f} below retry threshold {retry_threshold}. "
-                f"Retrying with {yaw_offset_deg:.2f} deg yaw offset from initial estimate "
-                f"(attempt {attempt + 1}/{max_attempts + 1})."
-            )
-            current_initial = self._rotate_pose_z(pose_estimation, math.radians(yaw_offset_deg))
-            attempt += 1
 
         transformation = best_transformation
         fitness = best_fitness
@@ -426,7 +517,7 @@ class FastLIOLocalization(Node):
             self.publish_odom(transformation)
         else:
             self.get_logger().warn(
-                f"Best fitness {fitness:.4f} across {attempt} attempt(s) still below threshold. "
+                f"Best fitness {fitness:.4f} across all search iterations still below threshold. "
                 "Tracking dropped to maintain last safe pose."
             )
 
