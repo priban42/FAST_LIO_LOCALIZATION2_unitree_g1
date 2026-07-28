@@ -150,7 +150,7 @@ class FastLIOLocalization(Node):
                 ("base_pitch", 0.0),  # 180 deg pitch to correct inverted mounting
                 ("base_yaw", 0.0),
                 # Configurable multi-scale ICP schedule
-                ("icp_scales", [5.0, 1.0]),
+                ("icp_scales", [5.0, 1.0, 0.5]),
                 # Yaw-retry behavior when fitness is too low
                 ("yaw_retry_fitness_threshold", 0.95),
                 ("yaw_retry_max_attempts", 4),
@@ -445,7 +445,7 @@ class FastLIOLocalization(Node):
                 cached_scans[scale] = scan_down
                 cached_maps[scale] = map_down
 
-        best_transformation = None
+        best_transformation = pose_estimation
         best_fitness = -1.0
         success = False
 
