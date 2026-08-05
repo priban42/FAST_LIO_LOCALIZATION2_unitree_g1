@@ -136,7 +136,6 @@ class FastLIOLocalization(Node):
             parameters=[
                 ("map_voxel_size", 0.4),
                 ("scan_voxel_size", 0.1),
-                ("freq_localization", 0.5),
                 ("freq_global_map", 0.25),
                 ("localization_threshold", 0.8),
                 ("fov", 6.28319),
@@ -195,11 +194,6 @@ class FastLIOLocalization(Node):
             )
         else:
             self.get_logger().warn("Gravity alignment deactivated (num_samples=0). Waiting for initialpose manual click.")
-
-        self.timer_localisation = self.create_timer(
-            1.0 / self.get_parameter("freq_localization").value,
-            self.localisation_timer_callback
-        )
 
     def cb_imu_align(self, msg: Imu):
         if self._gravity_aligned:
@@ -399,10 +393,8 @@ class FastLIOLocalization(Node):
             cropped_colors = np.squeeze(self.global_map_colors[indices, :])
             global_map_in_FOV.colors = o3d.utility.Vector3dVector(cropped_colors.astype(np.float64) / 255.0)
 
-        # --- FIXED LINES ---
         header = copy.deepcopy(self.cur_odom.header)
         header.frame_id = "map"
-        # -------------------
 
         sub_points = np.array(global_map_in_FOV.points)[::10]
         sub_rgb = cropped_colors[::10] if cropped_colors is not None else None
@@ -570,12 +562,15 @@ class FastLIOLocalization(Node):
     def cb_initialize_pose(self, msg):
         initial_pose = self.pose_to_mat(msg.pose.pose)
         T_upside_down = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-        initial_pose = initial_pose@T_upside_down
+        initial_pose = initial_pose @ T_upside_down
         self.initialized = True
-        self.get_logger().info("Initial pose overridden manually.")
+        self.get_logger().info("Initial pose received. Running global re-localization...")
 
         if self.cur_scan is not None:
             self.global_localization(initial_pose, is_initialpose=True)
+        else:
+            self.T_map_to_odom = initial_pose
+            self.get_logger().warn("Initial pose stored, waiting for the next point cloud scan to execute ICP.")
 
     def publish_odom(self, transform):
         odom_msg = Odometry()
@@ -588,13 +583,6 @@ class FastLIOLocalization(Node):
         odom_msg.header.stamp = self.get_clock().now().to_msg()
         odom_msg.header.frame_id = "map"
         self.pub_map_to_odom.publish(odom_msg)
-
-    def localisation_timer_callback(self):
-        if not self.initialized:
-            return
-
-        if self.cur_scan is not None:
-            self.global_localization(self.T_map_to_odom, is_initialpose=False)
 
 
 def main(args=None):
