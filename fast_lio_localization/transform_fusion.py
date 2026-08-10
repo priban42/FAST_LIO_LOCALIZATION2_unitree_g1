@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 
-import copy
-import threading
-import time
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose, Point, Quaternion
+from geometry_msgs.msg import Pose, Point, Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
-import rclpy.timer
-import tf_transformations
 import tf2_ros
-from geometry_msgs.msg import Transform
-from std_msgs.msg import Header
 
 
 class TransformFusion(Node):
@@ -29,76 +23,76 @@ class TransformFusion(Node):
         self.create_subscription(Odometry, "/map_to_odom", self.cb_save_map_to_odom, 1)
 
         self.freq_pub_localization = 50
-        self.timer = self.create_timer(1/self.freq_pub_localization, self.transform_fusion)
-        # threading.Thread(target=self.transform_fusion, daemon=True).start()
-
-    def pose_to_mat(self, pose_msg):
-        trans = np.eye(4)
-        trans[:3, 3] = [pose_msg.position.x, pose_msg.position.y, pose_msg.position.z]
-        quat = [pose_msg.orientation.x, pose_msg.orientation.y, pose_msg.orientation.z, pose_msg.orientation.w]
-        trans[:3, :3] = tf_transformations.quaternion_matrix(quat)[:3, :3]
-        return trans
-
-    def transform_fusion(self):
-        if self.cur_odom_to_baselink is None:
-            return
-
-        if self.cur_map_to_odom is not None:
-            T_map_to_odom = self.pose_to_mat(self.cur_map_to_odom.pose.pose)
-        else:
-            T_map_to_odom = np.eye(4)
-
-        transform_msg = Transform()
-        transform_msg.translation.x = T_map_to_odom[0, 3]
-        transform_msg.translation.y = T_map_to_odom[1, 3]
-        transform_msg.translation.z = T_map_to_odom[2, 3]
-        
-        quat = tf_transformations.quaternion_from_matrix(T_map_to_odom)
-
-        transform_msg.rotation.x = quat[0]
-        transform_msg.rotation.y = quat[1]
-        transform_msg.rotation.z = quat[2]
-        transform_msg.rotation.w = quat[3]
-        
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.cur_odom_to_baselink.header.frame_id
-        
-        # print(self.cur_odom_to_baselink.header)
-        transform_stamped_msg = tf2_ros.TransformStamped(
-                header = self.cur_odom_to_baselink.header,
-                child_frame_id = "camera_init",
-                transform = transform_msg
-            )
-        transform_stamped_msg.header.frame_id = "map"
-        self.tf_broadcaster.sendTransform(transform_stamped_msg)
-
-        cur_odom = copy.copy(self.cur_odom_to_baselink)
-        if cur_odom is not None:
-            T_odom_to_base_link = self.pose_to_mat(cur_odom.pose.pose)
-            T_map_to_base_link = np.matmul(T_map_to_odom, T_odom_to_base_link)
-
-            xyz = tf_transformations.translation_from_matrix(T_map_to_base_link)
-            quat = tf_transformations.quaternion_from_matrix(T_map_to_base_link)
-
-            localization = Odometry()
-            localization.pose.pose = Pose(
-                position = Point(x = xyz[0], y = xyz[1], z = xyz[2]), 
-                orientation = Quaternion(x = quat[0], y = quat[1], z = quat[2], w = quat[3])
-            )
-            localization.twist = cur_odom.twist
-
-            localization.header.stamp = self.get_clock().now().to_msg()
-            localization.header.frame_id = "map"
-            localization.child_frame_id = "body"
-            self.pub_localization.publish(localization)
-
+        self.timer = self.create_timer(1.0 / self.freq_pub_localization, self.transform_fusion)
 
     def cb_save_cur_odom(self, msg):
         self.cur_odom_to_baselink = msg
 
     def cb_save_map_to_odom(self, msg):
         self.cur_map_to_odom = msg
+
+    def transform_fusion(self):
+        odom_msg = self.cur_odom_to_baselink
+        if odom_msg is None:
+            return
+
+        map_to_odom_msg = self.cur_map_to_odom
+
+        # 1. Extract Map -> Odom pose directly (avoid matrix conversion roundtrips)
+        if map_to_odom_msg is not None:
+            p_m2o = map_to_odom_msg.pose.pose.position
+            q_m2o = map_to_odom_msg.pose.pose.orientation
+            pos_m2o = np.array([p_m2o.x, p_m2o.y, p_m2o.z])
+            rot_m2o = R.from_quat([q_m2o.x, q_m2o.y, q_m2o.z, q_m2o.w])
+        else:
+            pos_m2o = np.zeros(3)
+            rot_m2o = R.identity()
+
+        # 2. Publish TF: map -> camera_init
+        tf_stamped = TransformStamped()
+        tf_stamped.header.stamp = self.get_clock().now().to_msg()
+        tf_stamped.header.frame_id = "map"
+        tf_stamped.child_frame_id = "camera_init"
+
+        tf_stamped.transform.translation.x = pos_m2o[0]
+        tf_stamped.transform.translation.y = pos_m2o[1]
+        tf_stamped.transform.translation.z = pos_m2o[2]
+
+        q_m2o_vec = rot_m2o.as_quat()
+        tf_stamped.transform.rotation.x = q_m2o_vec[0]
+        tf_stamped.transform.rotation.y = q_m2o_vec[1]
+        tf_stamped.transform.rotation.z = q_m2o_vec[2]
+        tf_stamped.transform.rotation.w = q_m2o_vec[3]
+
+        self.tf_broadcaster.sendTransform(tf_stamped)
+
+        # 3. Fast Vector Composition: T_map_to_base = T_map_to_odom * T_odom_to_base
+        p_o2b = odom_msg.pose.pose.position
+        q_o2b = odom_msg.pose.pose.orientation
+        pos_o2b = np.array([p_o2b.x, p_o2b.y, p_o2b.z])
+        rot_o2b = R.from_quat([q_o2b.x, q_o2b.y, q_o2b.z, q_o2b.w])
+
+        # p_m2b = R_m2o * p_o2b + p_m2o
+        pos_m2b = rot_m2o.apply(pos_o2b) + pos_m2o
+        # R_m2b = R_m2o * R_o2b
+        rot_m2b = rot_m2o * rot_o2b
+        q_m2b_vec = rot_m2b.as_quat()
+
+        # 4. Construct and publish localization msg
+        localization = Odometry()
+        localization.header.stamp = self.get_clock().now().to_msg()
+        localization.header.frame_id = "map"
+        localization.child_frame_id = "body"
+
+        localization.pose.pose = Pose(
+            position=Point(x=pos_m2b[0], y=pos_m2b[1], z=pos_m2b[2]),
+            orientation=Quaternion(
+                x=q_m2b_vec[0], y=q_m2b_vec[1], z=q_m2b_vec[2], w=q_m2b_vec[3]
+            ),
+        )
+        localization.twist = odom_msg.twist
+
+        self.pub_localization.publish(localization)
 
 
 def main(args=None):
