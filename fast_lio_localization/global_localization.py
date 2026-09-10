@@ -274,7 +274,7 @@ class FastLIOLocalization(Node):
             1.0 * scale,
             initial,
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=10),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
         )
         return result_icp.transformation, result_icp.fitness
 
@@ -286,7 +286,7 @@ class FastLIOLocalization(Node):
             max_correspondence_distance=1.0 * scale,
             init_source_to_target=init_tensor,
             estimation_method=o3d.t.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=10),
+            criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
         )
         transformation = result_icp.transformation.numpy()
         fitness = float(result_icp.fitness)
