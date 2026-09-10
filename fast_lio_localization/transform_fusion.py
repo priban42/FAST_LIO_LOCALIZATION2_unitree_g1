@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from geometry_msgs.msg import Pose, Point, Quaternion, TransformStamped
 from nav_msgs.msg import Odometry
 import tf2_ros
@@ -15,6 +16,14 @@ class TransformFusion(Node):
 
         self.cur_odom_to_baselink = None
         self.cur_map_to_odom = None
+
+        # Stamp of the last /Odometry we already published downstream, so the
+        # 50 Hz timer does not re-broadcast a stale transform as if it were a
+        # fresh observation.
+        self._last_pub_odom_stamp = None
+        # Warn (throttled) once /Odometry lag crosses this, so the pipeline
+        # backlog is visible instead of silently feeding Nav2 an old pose.
+        self.stale_odom_warn_sec = 0.3
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.pub_localization = self.create_publisher(Odometry, "/localization", 1)
@@ -36,6 +45,24 @@ class TransformFusion(Node):
         if odom_msg is None:
             return
 
+        # Timestamp of the source odometry (= LiDAR sweep end time). Everything
+        # published here is stamped with this, NOT with wall-clock now(), so a
+        # stalled FAST-LIO shows up downstream as a TF timeout instead of a
+        # confident but seconds-old pose.
+        odom_stamp = odom_msg.header.stamp
+        odom_stamp_key = (odom_stamp.sec, odom_stamp.nanosec)
+        if odom_stamp_key == self._last_pub_odom_stamp:
+            # No new odometry since last tick - nothing fresh to assert.
+            return
+        self._last_pub_odom_stamp = odom_stamp_key
+
+        odom_age = (self.get_clock().now() - Time.from_msg(odom_stamp)).nanoseconds / 1e9
+        if odom_age > self.stale_odom_warn_sec:
+            self.get_logger().warn(
+                f"/Odometry is {odom_age:.2f}s old - localization/TF will be stale",
+                throttle_duration_sec=2.0,
+            )
+
         map_to_odom_msg = self.cur_map_to_odom
 
         # 1. Extract Map -> Odom pose directly (avoid matrix conversion roundtrips)
@@ -50,7 +77,7 @@ class TransformFusion(Node):
 
         # 2. Publish TF: map -> camera_init
         tf_stamped = TransformStamped()
-        tf_stamped.header.stamp = self.get_clock().now().to_msg()
+        tf_stamped.header.stamp = odom_stamp
         tf_stamped.header.frame_id = "map"
         tf_stamped.child_frame_id = "camera_init"
 
@@ -80,7 +107,7 @@ class TransformFusion(Node):
 
         # 4. Construct and publish localization msg
         localization = Odometry()
-        localization.header.stamp = self.get_clock().now().to_msg()
+        localization.header.stamp = odom_stamp
         localization.header.frame_id = "map"
         localization.child_frame_id = "body"
 
