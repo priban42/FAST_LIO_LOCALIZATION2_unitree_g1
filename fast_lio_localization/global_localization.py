@@ -80,7 +80,7 @@ class FastLIOLocalization(Node):
                 ("base_roll", 0.0),
                 ("base_pitch", 0.0),
                 ("base_yaw", 0.0),
-                ("icp_scales", [5.0, 1.0, 0.5]),
+                ("icp_scales", [5.0, 1.0]),
                 ("yaw_retry_fitness_threshold", 0.95),
                 ("yaw_retry_max_attempts", 4),
                 ("translation_retry_step", 7.0),
@@ -274,7 +274,7 @@ class FastLIOLocalization(Node):
             1.0 * scale,
             initial,
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30, relative_fitness=1e-7, relative_rmse=1e-7),
         )
         return result_icp.transformation, result_icp.fitness
 
@@ -286,7 +286,7 @@ class FastLIOLocalization(Node):
             max_correspondence_distance=1.0 * scale,
             init_source_to_target=init_tensor,
             estimation_method=o3d.t.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+            criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=30, relative_fitness=1e-7, relative_rmse=1e-7),
         )
         transformation = result_icp.transformation.numpy()
         fitness = float(result_icp.fitness)
