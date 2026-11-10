@@ -15,6 +15,13 @@ from sensor_msgs.msg import PointCloud2, Imu
 import tf_transformations
 import ros2_numpy
 
+try:  # installed next to this script; needs small_gicp (pip3 install small_gicp)
+    import fast_global_localizer
+    _FAST_IMPORT_ERROR = None
+except ImportError as e:
+    fast_global_localizer = None
+    _FAST_IMPORT_ERROR = e
+
 
 def quat_from_axis_angle(axis, angle):
     axis = axis / np.linalg.norm(axis)
@@ -86,14 +93,32 @@ class FastLIOLocalization(Node):
                 ("translation_retry_step", 7.0),
                 ("translation_retry_max_attempts", 9),
                 ("use_tensor_api", True),
+                # 'fast_gicp': multi-hypothesis VGICP (fast_global_localizer.py) on a few merged frames.
+                # 'icp': the point-to-point ICP with yaw / translation retries below.
+                ("localization_method", "fast_gicp"),
+                ("fast_search_radius", 6.0),      # m around the initial pose
+                ("fast_scan_frames", 10),         # /cloud_registered frames merged (10 = ~1 s)
+                ("fast_num_threads", 4),
             ],
         )
 
         self.pub_map_to_odom = self.create_publisher(Odometry, "/map_to_odom", 10)
 
+        self.method = str(self.get_parameter("localization_method").value).strip().lower()
+        if self.method not in ("fast_gicp", "icp"):
+            self.get_logger().error(f"Unknown localization_method '{self.method}', using 'fast_gicp'.")
+            self.method = "fast_gicp"
+        self.fast_localizer = None
+        self._raw_map_xyz = None
+        self._fast_clouds = []
+        self._fast_odoms = []
+
         self.get_logger().info("Waiting for global map...")
         self.initialize_global_map()
         self.get_logger().info("Global map received.")
+        if self.method == "fast_gicp":
+            self._init_fast_localizer()
+        self.get_logger().info(f"Global localization method: {self.method}")
 
         # Always listen for initialpose command
         self.create_subscription(PoseWithCovarianceStamped, "/initialpose", self.cb_initialize_pose, 10)
@@ -190,6 +215,15 @@ class FastLIOLocalization(Node):
         self._captured_scan_msg = None
         self._captured_odom_msg = None
 
+        if self.method == "fast_gicp":
+            self._fast_clouds = []
+            self._fast_odoms = []
+            n = self.get_parameter("fast_scan_frames").value
+            self.get_logger().info(f"Initial pose received. Collecting {n} frames of /cloud_registered and /Odometry...")
+            self._scan_sub = self.create_subscription(PointCloud2, "/cloud_registered", self._cb_fast_scan, 10)
+            self._odom_sub = self.create_subscription(Odometry, "/Odometry", self._cb_fast_odom, 10)
+            return
+
         self.get_logger().info("Initial pose received. Subscribing to /cloud_registered and /Odometry for single frame capture...")
 
         self._scan_sub = self.create_subscription(PointCloud2, "/cloud_registered", self._cb_one_shot_scan, 10)
@@ -248,6 +282,126 @@ class FastLIOLocalization(Node):
             self._processing_lock = False
 
             self.get_logger().info("Localization step completed. System returned to idle state.")
+
+    # ------------------------------------------------------------------
+    # Fast multi-hypothesis GICP (localization_method: fast_gicp)
+    # ------------------------------------------------------------------
+    def _init_fast_localizer(self):
+        if fast_global_localizer is None:
+            self.get_logger().error(
+                f"localization_method 'fast_gicp' needs small_gicp ({_FAST_IMPORT_ERROR}). "
+                "Install it with: pip3 install small_gicp. Falling back to 'icp'.")
+            self.method = "icp"
+            return
+        try:
+            params = {
+                "radius": float(self.get_parameter("fast_search_radius").value),
+                "num_threads": int(self.get_parameter("fast_num_threads").value),
+            }
+            self.fast_localizer = fast_global_localizer.FastGlobalLocalizer(self._raw_map_xyz, params)
+            self.get_logger().info(
+                f"fast_gicp ready: {self.fast_localizer.map_points} map points, search radius "
+                f"{params['radius']:.1f} m, prepared in {self.fast_localizer.build_time:.2f} s.")
+        except Exception as e:  # noqa: BLE001 - never leave the node without a localization method
+            self.get_logger().error(f"fast_gicp could not be prepared ({type(e).__name__}: {e}). Falling back to 'icp'.")
+            self.fast_localizer = None
+            self.method = "icp"
+        finally:
+            self._raw_map_xyz = None
+
+    @staticmethod
+    def _stamp(msg):
+        return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+    def _cb_fast_scan(self, msg: PointCloud2):
+        if self._pending_initial_pose_msg is None:
+            return
+        xyz, _ = self.msg_to_array(msg)
+        self._fast_clouds.append((self._stamp(msg), np.asarray(xyz, dtype=np.float64).reshape(-1, 3), msg))
+        n = max(1, int(self.get_parameter("fast_scan_frames").value))
+        del self._fast_clouds[:-n]
+        self._fast_try_localize()
+
+    def _cb_fast_odom(self, msg: Odometry):
+        if self._pending_initial_pose_msg is None:
+            return
+        self._fast_odoms.append((self._stamp(msg), msg))
+        del self._fast_odoms[:-100]
+        self._fast_try_localize()
+
+    def _fast_try_localize(self):
+        n = max(1, int(self.get_parameter("fast_scan_frames").value))
+        if len(self._fast_clouds) < n or not self._fast_odoms:
+            return
+        # FAST-LIO stamps a frame and its odometry identically: use the odometry of the newest frame.
+        stamp = self._fast_clouds[-1][0]
+        odom = next((m for s, m in reversed(self._fast_odoms) if abs(s - stamp) < 0.005), None)
+        if odom is None:
+            if self._fast_odoms[-1][0] < stamp + 0.3:
+                return   # its odometry may still come
+            odom = min(self._fast_odoms, key=lambda so: abs(so[0] - stamp))[1]
+            self.get_logger().warn("No odometry with the stamp of the newest frame, using the closest one.")
+
+        for attr in ("_scan_sub", "_odom_sub"):
+            if getattr(self, attr) is not None:
+                self.destroy_subscription(getattr(self, attr))
+                setattr(self, attr, None)
+        clouds = self._fast_clouds
+        pose_msg = self._pending_initial_pose_msg
+        self._fast_clouds, self._fast_odoms = [], []
+        try:
+            self._fast_localization(pose_msg, clouds, odom)
+        finally:
+            self._pending_initial_pose_msg = None
+            self._processing_lock = False
+            self.get_logger().info("Localization step completed. System returned to idle state.")
+
+    def _fast_guess(self, initial_pose_mat, T_odom_to_base_link):
+        """Initial map->body estimate. An initial pose without roll/pitch (the map view sends x, y, yaw)
+        gets them from gravity: the current map->odom (IMU gravity alignment or the previous localization)
+        with the odometry; only its heading is replaced by the initial pose's. Poses with roll/pitch
+        (e.g. from localization_monitor) are used as they are."""
+        guess = initial_pose_mat.copy()
+        if abs(guess[2, 2]) < math.cos(math.radians(0.5)):
+            return guess, "initial pose"
+        prior = self.T_map_to_odom @ T_odom_to_base_link
+        dyaw = math.atan2(guess[1, 0], guess[0, 0]) - math.atan2(prior[1, 0], prior[0, 0])
+        c, s = math.cos(dyaw), math.sin(dyaw)
+        guess[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]) @ prior[:3, :3]
+        return guess, "gravity"
+
+    def _fast_localization(self, pose_msg, clouds, odom_msg):
+        T_odom_to_base_link = self.pose_to_mat(odom_msg.pose.pose)
+        T_base_link_to_odom = self.inverse_se3(T_odom_to_base_link)
+        T_upside_down = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+        initial_pose_mat = self.pose_to_mat(pose_msg.pose.pose) @ T_upside_down
+        guess, tilt_from = self._fast_guess(initial_pose_mat, T_odom_to_base_link)
+
+        merged = np.vstack([c[1] for c in clouds])     # camera_init (odom) frame
+        cloud_body = merged @ T_base_link_to_odom[:3, :3].T + T_base_link_to_odom[:3, 3]
+        self.get_logger().info(
+            f"fast_gicp: {len(clouds)} frames, {len(cloud_body)} points, roll/pitch from {tilt_from}. Computing alignment...")
+        try:
+            T_map_body, score, info = self.fast_localizer.localize(cloud_body, guess)
+        except Exception as e:  # noqa: BLE001 - fall back to the previous method for this request
+            self.get_logger().error(f"fast_gicp failed ({type(e).__name__}: {e}). Using 'icp' for this initial pose.")
+            cur_scan = o3d.geometry.PointCloud()
+            cur_scan.points = o3d.utility.Vector3dVector(clouds[-1][1])
+            pose_estimation = np.matmul(initial_pose_mat, T_base_link_to_odom)
+            self.global_localization(pose_estimation, is_initialpose=True, cur_scan=cur_scan, cur_odom=odom_msg)
+            return
+
+        transformation = T_map_body @ T_base_link_to_odom
+        d = T_map_body[:3, 3] - guess[:3, 3]
+        dyaw = math.degrees(math.atan2(T_map_body[1, 0], T_map_body[0, 0]) - math.atan2(guess[1, 0], guess[0, 0]))
+        dyaw = (dyaw + 180.0) % 360.0 - 180.0
+        self.get_logger().info(
+            f"fast_gicp: score {score:.3f} (fraction within 0.3 m of the map), moved {math.hypot(d[0], d[1]):.2f} m "
+            f"and {dyaw:.1f} deg from the initial pose, {info['hypotheses']} hypotheses, {info['refined']} refined, "
+            f"{info['time'] * 1000:.0f} ms.")
+        self.get_logger().info(f"Applying transformation matrix (Fitness: {score:.4f})")
+        self.T_map_to_odom = transformation
+        self.publish_odom(transformation)
 
     # ------------------------------------------------------------------
     # Helper Functions & ICP Logic
@@ -480,6 +634,8 @@ class FastLIOLocalization(Node):
 
     def initialize_global_map(self):
         self.global_map = o3d.io.read_point_cloud(self.get_parameter("pcd_map_path").value)
+        if self.method == "fast_gicp":   # fast_gicp uses the full-resolution map (it downsamples to 0.1 m)
+            self._raw_map_xyz = np.asarray(self.global_map.points).copy()
         self.global_map = self.voxel_down_sample(self.global_map, self.get_parameter("map_voxel_size").value)
 
         if len(self.global_map.colors) > 0:

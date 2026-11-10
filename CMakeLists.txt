@@ -139,5 +139,10 @@ install(PROGRAMS
   fast_lio_localization/invert_livox_scan.py
   DESTINATION lib/${PROJECT_NAME}
 )
+# Module imported by global_localization.py (localization_method: fast_gicp)
+install(FILES
+  fast_lio_localization/fast_global_localizer.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()
