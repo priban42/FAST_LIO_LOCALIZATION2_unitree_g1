@@ -99,6 +99,10 @@ class FastLIOLocalization(Node):
                 ("fast_search_radius", 6.0),      # m around the initial pose
                 ("fast_scan_frames", 10),         # /cloud_registered frames merged (10 = ~1 s)
                 ("fast_num_threads", 4),
+                # fast_gicp: localize by itself once after the IMU gravity alignment, without an initial
+                # pose: around "started where the map was recorded" and over the whole map, the better wins.
+                ("startup_localization", True),
+                ("startup_min_score", 0.5),       # fraction of points within 0.3 m of the map to apply it
             ],
         )
 
@@ -112,6 +116,7 @@ class FastLIOLocalization(Node):
         self._raw_map_xyz = None
         self._fast_clouds = []
         self._fast_odoms = []
+        self._fast_capture = None   # None | "initialpose" | "startup": what the frames are collected for
 
         self.get_logger().info("Waiting for global map...")
         self.initialize_global_map()
@@ -197,6 +202,7 @@ class FastLIOLocalization(Node):
         self.get_logger().info("Gravity Alignment Success! System now idle and waiting for initialpose.")
 
         self.destroy_subscription(self._imu_sub)
+        self._start_startup_localization()
 
     # ------------------------------------------------------------------
     # On-Demand Single-Frame Capture Trigger
@@ -205,6 +211,12 @@ class FastLIOLocalization(Node):
         if not self.initialized:
             self.get_logger().warn("System not yet fully initialized/gravity aligned. Ignoring initialpose.")
             return
+
+        if self._processing_lock and self._fast_capture == "startup":
+            # An initial pose from the user / monitor replaces the startup localization still collecting frames.
+            self.get_logger().info("Initial pose received during the startup localization: using the initial pose.")
+            self._stop_fast_capture()
+            self._processing_lock = False
 
         if self._processing_lock:
             self.get_logger().warn("Localization already in progress. Ignoring concurrent initialpose request.")
@@ -220,6 +232,7 @@ class FastLIOLocalization(Node):
             self._fast_odoms = []
             n = self.get_parameter("fast_scan_frames").value
             self.get_logger().info(f"Initial pose received. Collecting {n} frames of /cloud_registered and /Odometry...")
+            self._fast_capture = "initialpose"
             self._scan_sub = self.create_subscription(PointCloud2, "/cloud_registered", self._cb_fast_scan, 10)
             self._odom_sub = self.create_subscription(Odometry, "/Odometry", self._cb_fast_odom, 10)
             return
@@ -313,8 +326,32 @@ class FastLIOLocalization(Node):
     def _stamp(msg):
         return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
+    def _start_startup_localization(self):
+        if not self.get_parameter("startup_localization").value:
+            return
+        if self.method != "fast_gicp" or self.fast_localizer is None:
+            self.get_logger().info("Startup localization needs localization_method 'fast_gicp': waiting for initialpose.")
+            return
+        if self._processing_lock:
+            return
+        n = self.get_parameter("fast_scan_frames").value
+        self.get_logger().info(f"Startup localization: collecting {n} frames of /cloud_registered and /Odometry...")
+        self._processing_lock = True
+        self._fast_clouds, self._fast_odoms = [], []
+        self._fast_capture = "startup"
+        self._scan_sub = self.create_subscription(PointCloud2, "/cloud_registered", self._cb_fast_scan, 10)
+        self._odom_sub = self.create_subscription(Odometry, "/Odometry", self._cb_fast_odom, 10)
+
+    def _stop_fast_capture(self):
+        for attr in ("_scan_sub", "_odom_sub"):
+            if getattr(self, attr) is not None:
+                self.destroy_subscription(getattr(self, attr))
+                setattr(self, attr, None)
+        self._fast_capture = None
+        self._fast_clouds, self._fast_odoms = [], []
+
     def _cb_fast_scan(self, msg: PointCloud2):
-        if self._pending_initial_pose_msg is None:
+        if self._fast_capture is None:
             return
         xyz, _ = self.msg_to_array(msg)
         self._fast_clouds.append((self._stamp(msg), np.asarray(xyz, dtype=np.float64).reshape(-1, 3), msg))
@@ -323,7 +360,7 @@ class FastLIOLocalization(Node):
         self._fast_try_localize()
 
     def _cb_fast_odom(self, msg: Odometry):
-        if self._pending_initial_pose_msg is None:
+        if self._fast_capture is None:
             return
         self._fast_odoms.append((self._stamp(msg), msg))
         del self._fast_odoms[:-100]
@@ -342,27 +379,29 @@ class FastLIOLocalization(Node):
             odom = min(self._fast_odoms, key=lambda so: abs(so[0] - stamp))[1]
             self.get_logger().warn("No odometry with the stamp of the newest frame, using the closest one.")
 
-        for attr in ("_scan_sub", "_odom_sub"):
-            if getattr(self, attr) is not None:
-                self.destroy_subscription(getattr(self, attr))
-                setattr(self, attr, None)
         clouds = self._fast_clouds
+        kind = self._fast_capture
         pose_msg = self._pending_initial_pose_msg
-        self._fast_clouds, self._fast_odoms = [], []
+        self._stop_fast_capture()
         try:
-            self._fast_localization(pose_msg, clouds, odom)
+            if kind == "startup":
+                self._startup_localization(clouds, odom)
+            else:
+                self._fast_localization(pose_msg, clouds, odom)
+        except Exception as e:  # noqa: BLE001 - keep the node alive and unlocked
+            self.get_logger().error(f"Localization failed: {type(e).__name__}: {e}")
         finally:
             self._pending_initial_pose_msg = None
             self._processing_lock = False
             self.get_logger().info("Localization step completed. System returned to idle state.")
 
-    def _fast_guess(self, initial_pose_mat, T_odom_to_base_link):
+    def _fast_guess(self, initial_pose_mat, T_odom_to_base_link, force_gravity=False):
         """Initial map->body estimate. An initial pose without roll/pitch (the map view sends x, y, yaw)
         gets them from gravity: the current map->odom (IMU gravity alignment or the previous localization)
         with the odometry; only its heading is replaced by the initial pose's. Poses with roll/pitch
         (e.g. from localization_monitor) are used as they are."""
         guess = initial_pose_mat.copy()
-        if abs(guess[2, 2]) < math.cos(math.radians(0.5)):
+        if not force_gravity and abs(guess[2, 2]) < math.cos(math.radians(0.5)):
             return guess, "initial pose"
         prior = self.T_map_to_odom @ T_odom_to_base_link
         dyaw = math.atan2(guess[1, 0], guess[0, 0]) - math.atan2(prior[1, 0], prior[0, 0])
@@ -399,6 +438,41 @@ class FastLIOLocalization(Node):
             f"fast_gicp: score {score:.3f} (fraction within 0.3 m of the map), moved {math.hypot(d[0], d[1]):.2f} m "
             f"and {dyaw:.1f} deg from the initial pose, {info['hypotheses']} hypotheses, {info['refined']} refined, "
             f"{info['time'] * 1000:.0f} ms.")
+        self.get_logger().info(f"Applying transformation matrix (Fitness: {score:.4f})")
+        self.T_map_to_odom = transformation
+        self.publish_odom(transformation)
+
+    def _startup_localization(self, clouds, odom_msg):
+        """Localize without an initial pose. Two searches:
+        - local: around the pose that map->odom = identity gives (the robot started where the map was
+          recorded, which is what transform_fusion assumes until the first /map_to_odom);
+        - global: every heading at every position of the map.
+        The local result wins unless the global one fits clearly better (a similar place elsewhere must
+        not win by a hair). Applied only if it fits the map (startup_min_score)."""
+        T_odom_to_base_link = self.pose_to_mat(odom_msg.pose.pose)
+        T_base_link_to_odom = self.inverse_se3(T_odom_to_base_link)
+        cloud_body = np.vstack([c[1] for c in clouds]) @ T_base_link_to_odom[:3, :3].T + T_base_link_to_odom[:3, 3]
+        guess, _ = self._fast_guess(T_odom_to_base_link, T_odom_to_base_link, force_gravity=True)
+        self.get_logger().info(f"Startup localization: {len(clouds)} frames, {len(cloud_body)} points. Searching...")
+
+        T_local, s_local, i_local = self.fast_localizer.localize(cloud_body, guess)
+        T_global, s_global, i_global = self.fast_localizer.localize_global(cloud_body, guess, float(guess[2, 3]))
+        d = T_global[:3, 3] - T_local[:3, 3]
+        same = math.hypot(d[0], d[1]) < 0.5
+        use_global = not same and s_global > s_local + 0.03
+        T_map_body, score, which = (T_global, s_global, "whole map") if use_global else (T_local, s_local, "start area")
+        self.get_logger().info(
+            f"Startup localization: start area score {s_local:.3f} ({i_local['time'] * 1000:.0f} ms), whole map "
+            f"score {s_global:.3f} ({i_global['positions']} positions, {i_global['time'] * 1000:.0f} ms)"
+            f"{', same pose' if same else ''} -> {which}, x {T_map_body[0, 3]:.2f} y {T_map_body[1, 3]:.2f} "
+            f"yaw {math.degrees(math.atan2(T_map_body[1, 0], T_map_body[0, 0])):.1f} deg.")
+        min_score = float(self.get_parameter("startup_min_score").value)
+        if score < min_score:
+            self.get_logger().warn(
+                f"Startup localization: best score {score:.3f} below startup_min_score {min_score:.2f}, not applied. "
+                "Set the initial pose.")
+            return
+        transformation = T_map_body @ T_base_link_to_odom
         self.get_logger().info(f"Applying transformation matrix (Fitness: {score:.4f})")
         self.T_map_to_odom = transformation
         self.publish_odom(transformation)
